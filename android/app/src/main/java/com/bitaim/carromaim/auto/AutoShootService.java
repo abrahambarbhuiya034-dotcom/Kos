@@ -8,48 +8,49 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 
-import java.io.DataOutputStream;
-
 /**
- * AutoShootService — v9.0 MULTI-STRATEGY BOT ENGINE
+ * AutoShootService — v10.0  SLINGSHOT + FORWARD DUAL ENGINE
  *
- * The bot fires the striker using up to 4 strategies tried in sequence.
- * This makes it resilient to:
- *   • Games that need the gesture to start exactly on the striker circle
- *   • Games using slingshot mechanic (drag BACKWARD → shoot forward)
- *   • Slight CV detection offset errors (tries ±15 px around detected position)
- *   • AccessibilityService gesture engine being momentarily busy
+ * ROOT CAUSE FIX (v10.0):
+ *   Carrom Disc Pool uses a SLINGSHOT / PULL-BACK mechanic.
+ *   You drag the striker BACKWARD (away from target) then release — the
+ *   game flings it forward.  Every version before v10 was swiping FORWARD,
+ *   which the game ignores because you never pulled anything.
  *
- * Strategy execution order
- * ─────────────────────────
- *  S1  Fast forward flick  — touch striker, drag 80 px toward target in 25 ms
- *  S2  Slower power swipe  — same direction, 100 px in 50 ms (more deliberate)
- *  S3  Offset search       — try S1 from 4 neighbouring positions ±15 px
- *  S4  Shell input swipe   — `su -c input swipe` for rooted devices
+ * Strategy order
+ * ──────────────────────────────────────────────────────────────────────────
+ *  S1  SLINGSHOT  150 px BACKWARD from striker, 40 ms   ← PRIMARY FIX
+ *  S2  FORWARD    150 px FORWARD  from striker, 35 ms   ← in case game is forward
+ *  S3  SLINGSHOT  200 px BACKWARD, 55 ms (harder pull)
+ *  S4  Root shell `input swipe` backward direction
  *
- * Results are logged with TAG so adb logcat shows exactly which fired.
+ * All strategies log to TAG "CarromBot" — use:
+ *   adb logcat -s CarromBot
+ * to watch exactly which strategy fired and whether it completed.
  */
 public class AutoShootService extends AccessibilityService {
 
     private static final String TAG = "CarromBot";
 
     public static volatile AutoShootService INSTANCE;
-
-    // Tracks last shot result for debugging
     public static volatile String lastShotResult = "none";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Lifecycle
+    // ─────────────────────────────────────────────────────────────────────────
 
     @Override
     public void onServiceConnected() {
         super.onServiceConnected();
         INSTANCE = this;
         lastShotResult = "connected";
-        Log.i(TAG, "=== CarromBot v9.0 CONNECTED — ready to fire ===");
+        Log.i(TAG, "=== CarromBot v10.0 CONNECTED — slingshot engine ready ===");
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {}
-    @Override public void onInterrupt() { Log.w(TAG, "interrupted"); }
+    @Override public void onInterrupt() {}
 
     @Override
     public void onDestroy() {
@@ -57,177 +58,162 @@ public class AutoShootService extends AccessibilityService {
         handler.removeCallbacksAndMessages(null);
         INSTANCE = null;
         lastShotResult = "disconnected";
-        Log.i(TAG, "CarromBot destroyed");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Main shoot() — tries all strategies
+    // shoot() — called by FloatingOverlayService once board is stable
+    //
+    //  strikerX/Y  = striker centre in screen pixels (from CV, already scaled)
+    //  targetX/Y   = point in SHOT direction from striker (ghost ball position)
+    //  powerFrac   = 0.0 … 1.0
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Fire the striker.
-     *
-     * @param strikerX  CV-detected striker centre X (screen pixels)
-     * @param strikerY  CV-detected striker centre Y (screen pixels)
-     * @param targetX   Ghost-ball aim point X (shot direction reference)
-     * @param targetY   Ghost-ball aim point Y
-     * @param powerFrac 0.0 … 1.0 shot power
-     */
     public void shoot(final float strikerX, final float strikerY,
                       final float targetX,  final float targetY,
                       final float powerFrac) {
 
         float power = Math.min(1.0f, Math.max(0.0f, powerFrac));
 
+        // Unit vector FROM striker TOWARD target (forward direction)
         float dx  = targetX - strikerX;
         float dy  = targetY - strikerY;
         float len = (float) Math.sqrt(dx * dx + dy * dy);
-        if (len < 1f) { Log.w(TAG, "shoot: degenerate direction"); return; }
+        if (len < 1f) { Log.w(TAG, "shoot: zero-length direction, skipping"); return; }
 
-        final float nx = dx / len;
-        final float ny = dy / len;
+        final float fwdX = dx / len;   // forward direction (toward target)
+        final float fwdY = dy / len;
+        final float bkX  = -fwdX;      // backward direction (pull = slingshot)
+        final float bkY  = -fwdY;
 
         Log.i(TAG, String.format(
-            "CarromBot shoot — striker=(%.0f,%.0f) dir=(%.2f,%.2f) power=%.2f",
-            strikerX, strikerY, nx, ny, power));
+            "CarromBot shoot — striker=(%.0f,%.0f) fwd=(%.2f,%.2f) pwr=%.2f",
+            strikerX, strikerY, fwdX, fwdY, power));
 
-        // ── S1: Fast forward flick (80 px, 25 ms) ────────────────────────────
-        boolean s1 = fireGesture(strikerX, strikerY,
-                                  strikerX + nx * 80f,
-                                  strikerY + ny * 80f,
-                                  25L, "S1-FastFlick");
+        // ── S1: PRIMARY — Slingshot backward 150 px in 40 ms ─────────────────
+        // Drag striker AWAY from target → game launches it toward target
+        float s1dist = 120f + power * 50f;   // 120–170 px
+        boolean s1 = fireSwipe(
+            strikerX, strikerY,
+            strikerX + bkX * s1dist,
+            strikerY + bkY * s1dist,
+            40L, "S1-Slingshot-" + Math.round(s1dist) + "px");
         if (s1) return;
 
-        // ── S2: Deliberate power swipe (100 px, 50 ms) — 80ms later ──────────
+        // ── S2: FALLBACK — Forward flick 150 px in 35 ms (some carrom games) ─
         handler.postDelayed(() -> {
-            boolean s2 = fireGesture(strikerX, strikerY,
-                                      strikerX + nx * 100f,
-                                      strikerY + ny * 100f,
-                                      50L, "S2-PowerSwipe");
+            float s2dist = 120f + power * 50f;
+            boolean s2 = fireSwipe(
+                strikerX, strikerY,
+                strikerX + fwdX * s2dist,
+                strikerY + fwdY * s2dist,
+                35L, "S2-Forward-" + Math.round(s2dist) + "px");
             if (s2) return;
 
-            // ── S3: Search ±15 px around striker centre — 160ms later ─────────
+            // ── S3: Harder slingshot 200 px 55 ms ────────────────────────────
             handler.postDelayed(() -> {
-                float[][] offsets = {{0,-15},{0,15},{-15,0},{15,0}};
-                for (float[] off : offsets) {
-                    boolean ok = fireGesture(
-                        strikerX + off[0], strikerY + off[1],
-                        strikerX + off[0] + nx * 80f,
-                        strikerY + off[1] + ny * 80f,
-                        25L, "S3-Offset(" + (int)off[0] + "," + (int)off[1] + ")");
-                    if (ok) return;
-                }
+                float s3dist = 180f + power * 50f;   // 180–230 px
+                boolean s3 = fireSwipe(
+                    strikerX, strikerY,
+                    strikerX + bkX * s3dist,
+                    strikerY + bkY * s3dist,
+                    55L, "S3-HardSling-" + Math.round(s3dist) + "px");
+                if (s3) return;
 
-                // ── S4: Root shell input swipe — 250ms later ──────────────────
-                handler.postDelayed(() -> tryRootSwipe(
-                    strikerX, strikerY, nx, ny, power), 90);
+                // ── S4: Root shell fallback ───────────────────────────────────
+                handler.postDelayed(() ->
+                    tryRootSwipe(strikerX, strikerY, bkX, bkY, power), 80);
 
             }, 80);
         }, 80);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Core gesture dispatcher
+    // testFire() — called by popup "TEST SHOT" button
+    // Fires a visible slingshot swipe at the given position so you can see
+    // if the accessibility service is actually injecting gestures.
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Dispatch a single straight swipe via AccessibilityService.
-     * Returns true if dispatchGesture accepted the request (does NOT guarantee
-     * the game saw it — watch logcat for "onCompleted" vs "onCancelled").
-     */
-    private boolean fireGesture(float x0, float y0,
-                                 float x1, float y1,
-                                 long durationMs, final String label) {
-        Path path = new Path();
-        path.moveTo(x0, y0);
-        path.lineTo(x1, y1);
-
-        GestureDescription.Builder gb = new GestureDescription.Builder();
-        gb.addStroke(new GestureDescription.StrokeDescription(path, 0L, durationMs));
-
-        boolean accepted = dispatchGesture(gb.build(), new GestureResultCallback() {
-            @Override public void onCompleted(GestureDescription g) {
-                lastShotResult = label + ":completed";
-                Log.i(TAG, label + " → onCompleted (gesture delivered)");
-            }
-            @Override public void onCancelled(GestureDescription g) {
-                lastShotResult = label + ":cancelled";
-                Log.w(TAG, label + " → onCancelled (game may have ignored it)");
-            }
-        }, null);
-
-        Log.d(TAG, label + " dispatchGesture=" + accepted
-            + " from=("+Math.round(x0)+","+Math.round(y0)+")"
-            + " to=("+Math.round(x1)+","+Math.round(y1)+")"
-            + " dur="+durationMs+"ms");
-
-        if (!accepted) lastShotResult = label + ":rejected";
-        return accepted;
+    public boolean testFire(float x, float y) {
+        Log.i(TAG, "TEST FIRE (slingshot DOWN) at (" + Math.round(x) + "," + Math.round(y) + ")");
+        // Pull downward 150 px — the striker should fling upward
+        return fireSwipe(x, y, x, y + 150f, 40L, "TEST-Sling");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // S4: Root shell input swipe
+    // Core gesture engine
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Injects a swipe via `su -c input swipe` (rooted devices only).
-     * Falls back to `input swipe` without su (works on some ADB-enabled shells).
-     * Safe to call on non-rooted devices — it will just log a warning.
-     */
-    private void tryRootSwipe(float sx, float sy, float nx, float ny, float power) {
-        float dist = 80f + power * 40f;
-        float ex   = sx + nx * dist;
-        float ey   = sy + ny * dist;
-        long  dur  = (long)(50f - power * 25f);
-
-        String cmd = String.format("input swipe %.0f %.0f %.0f %.0f %d",
-            sx, sy, ex, ey, dur);
-
-        Log.i(TAG, "S4-Root attempting: " + cmd);
-
-        // Try with root (su)
-        if (execShell("su", "-c", cmd)) {
-            lastShotResult = "S4-Root:ok";
-            Log.i(TAG, "S4-Root: success via su");
-            return;
-        }
-        // Try without su (ADB shell privilege if available)
-        if (execShell("sh", "-c", cmd)) {
-            lastShotResult = "S4-Shell:ok";
-            Log.i(TAG, "S4-Shell: success via sh");
-            return;
-        }
-        lastShotResult = "S4:failed-no-root";
-        Log.w(TAG, "S4: root/shell not available — device may need to be rooted");
-    }
-
-    private boolean execShell(String... cmd) {
+    private boolean fireSwipe(float x0, float y0, float x1, float y1,
+                               long durationMs, final String label) {
         try {
-            Process p = Runtime.getRuntime().exec(cmd);
-            p.waitFor();
-            return p.exitValue() == 0;
+            Path path = new Path();
+            path.moveTo(x0, y0);
+            path.lineTo(x1, y1);
+
+            GestureDescription gesture = new GestureDescription.Builder()
+                .addStroke(new GestureDescription.StrokeDescription(path, 0L, durationMs))
+                .build();
+
+            boolean accepted = dispatchGesture(gesture, new GestureResultCallback() {
+                @Override public void onCompleted(GestureDescription g) {
+                    lastShotResult = label + ":OK";
+                    Log.i(TAG, label + " -> COMPLETED (gesture delivered to game)");
+                }
+                @Override public void onCancelled(GestureDescription g) {
+                    lastShotResult = label + ":CANCELLED";
+                    Log.w(TAG, label + " -> CANCELLED (game window may have FLAG_SECURE)");
+                }
+            }, null);
+
+            Log.d(TAG, label
+                + " dispatch=" + accepted
+                + " (" + Math.round(x0) + "," + Math.round(y0) + ")"
+                + "->(" + Math.round(x1) + "," + Math.round(y1) + ")"
+                + " " + durationMs + "ms");
+
+            if (!accepted) lastShotResult = label + ":REJECTED";
+            return accepted;
+
         } catch (Exception e) {
+            Log.e(TAG, label + " EXCEPTION: " + e.getMessage());
             return false;
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Test fire — called from popup "TEST SHOT" button
+    // Root shell fallback (rooted devices)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /**
-     * Fire a simple test swipe UP from the given position.
-     * Use this to verify the accessibility service gesture injection works
-     * BEFORE enabling full AutoPlay.
-     */
-    public boolean testFire(float x, float y) {
-        Log.i(TAG, "TEST FIRE at (" + Math.round(x) + "," + Math.round(y) + ")");
-        return fireGesture(x, y, x, y - 80f, 30L, "TEST");
+    private void tryRootSwipe(float sx, float sy,
+                               float bkX, float bkY, float power) {
+        float dist = 150f + power * 50f;
+        float ex = sx + bkX * dist;
+        float ey = sy + bkY * dist;
+        String cmd = String.format("input swipe %.0f %.0f %.0f %.0f 40", sx, sy, ex, ey);
+        Log.i(TAG, "S4-Root: " + cmd);
+        try {
+            Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
+            int exit = p.waitFor();
+            lastShotResult = "S4-Root:exit=" + exit;
+            Log.i(TAG, "S4-Root exit=" + exit);
+        } catch (Exception e) {
+            try {
+                Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+                lastShotResult = "S4-Shell:sent";
+            } catch (Exception e2) {
+                lastShotResult = "S4:no-root";
+                Log.w(TAG, "S4: root unavailable");
+            }
+        }
     }
 
-    public static boolean isReady() { return INSTANCE != null; }
-    public static String getStatus() {
-        if (INSTANCE == null) return "NOT CONNECTED — Enable in Accessibility Settings";
-        return "CONNECTED — last: " + lastShotResult;
+    // ─────────────────────────────────────────────────────────────────────────
+    // Status helpers
+    // ─────────────────────────────────────────────────────────────────────────
+
+    public static boolean isReady()   { return INSTANCE != null; }
+    public static String  getStatus() {
+        if (INSTANCE == null) return "NOT CONNECTED";
+        return "CONNECTED last=" + lastShotResult;
     }
 }
