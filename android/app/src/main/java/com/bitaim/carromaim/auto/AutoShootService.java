@@ -8,33 +8,35 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 
+import java.io.DataOutputStream;
+
 /**
- * AutoShootService — v8.6 ENGINE
+ * AutoShootService — v9.0 MULTI-STRATEGY BOT ENGINE
  *
- * Previous versions swept the gesture 250–550 px across the whole screen
- * (a full-screen swipe). Carrom Disc Pool does NOT need that. Its touch
- * handler reads only:
- *   1. WHERE the gesture starts  (must be on/near the striker circle)
- *   2. The DIRECTION of the drag (determines shot angle)
- *   3. The VELOCITY of the drag  (determines shot power — NOT total distance)
+ * The bot fires the striker using up to 4 strategies tried in sequence.
+ * This makes it resilient to:
+ *   • Games that need the gesture to start exactly on the striker circle
+ *   • Games using slingshot mechanic (drag BACKWARD → shoot forward)
+ *   • Slight CV detection offset errors (tries ±15 px around detected position)
+ *   • AccessibilityService gesture engine being momentarily busy
  *
- * v8.6 "local flick" engine
+ * Strategy execution order
  * ─────────────────────────
- *   • Gesture stays LOCAL to the striker — maximum 90 px travel
- *   • Very fast (20–35 ms) → high velocity → registers as a real shot
- *   • Two-phase: tiny 8-px pre-touch THEN the directional flick
- *     This pre-touch ensures the game "sees" the striker before the swipe,
- *     matching exactly how a human finger touches-then-drags the striker.
- *   • Shot angle is derived purely from the CarromAI physics engine output:
- *     the angle from striker centre → ghost-ball contact point.
+ *  S1  Fast forward flick  — touch striker, drag 80 px toward target in 25 ms
+ *  S2  Slower power swipe  — same direction, 100 px in 50 ms (more deliberate)
+ *  S3  Offset search       — try S1 from 4 neighbouring positions ±15 px
+ *  S4  Shell input swipe   — `su -c input swipe` for rooted devices
  *
- * No screen-wide swipes. No full-board gestures. Pure local striker control.
+ * Results are logged with TAG so adb logcat shows exactly which fired.
  */
 public class AutoShootService extends AccessibilityService {
 
-    private static final String TAG = "AutoShootService";
+    private static final String TAG = "CarromBot";
 
     public static volatile AutoShootService INSTANCE;
+
+    // Tracks last shot result for debugging
+    public static volatile String lastShotResult = "none";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
 
@@ -42,7 +44,8 @@ public class AutoShootService extends AccessibilityService {
     public void onServiceConnected() {
         super.onServiceConnected();
         INSTANCE = this;
-        Log.i(TAG, "AutoShootService v8.6 ENGINE connected");
+        lastShotResult = "connected";
+        Log.i(TAG, "=== CarromBot v9.0 CONNECTED — ready to fire ===");
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {}
@@ -53,32 +56,22 @@ public class AutoShootService extends AccessibilityService {
         super.onDestroy();
         handler.removeCallbacksAndMessages(null);
         INSTANCE = null;
-        Log.i(TAG, "AutoShootService destroyed");
+        lastShotResult = "disconnected";
+        Log.i(TAG, "CarromBot destroyed");
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Main shoot() — tries all strategies
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Fire the striker using a LOCAL flick gesture.
+     * Fire the striker.
      *
-     * The gesture is a two-stroke sequence:
-     *
-     *   Stroke 0 — Pre-touch (8 px, 18 ms):
-     *     Touch down at striker centre, hold briefly so the game recognises
-     *     the striker is being interacted with. Ends just 8 px forward.
-     *     willContinue = true  (stroke 1 immediately follows).
-     *
-     *   Stroke 1 — Power flick (60–90 px, 20–35 ms):
-     *     Fast drag in the shot direction. This is the actual shot gesture.
-     *     Starts where stroke 0 ended (8 px ahead), ends at 60–90 px total.
-     *     willContinue = false (releases the finger here).
-     *
-     * Total finger travel: ~70–100 px — completely local to the striker.
-     * Velocity: ~2 000–4 500 px/s — registers as a strong, fast shot.
-     *
-     * @param strikerX   striker centre X (screen pixels, from CV detection)
-     * @param strikerY   striker centre Y
-     * @param targetX    ghost-ball aim point X (determines shot angle only)
-     * @param targetY    ghost-ball aim point Y
-     * @param powerFrac  0.0 (soft) … 1.0 (maximum power)
+     * @param strikerX  CV-detected striker centre X (screen pixels)
+     * @param strikerY  CV-detected striker centre Y (screen pixels)
+     * @param targetX   Ghost-ball aim point X (shot direction reference)
+     * @param targetY   Ghost-ball aim point Y
+     * @param powerFrac 0.0 … 1.0 shot power
      */
     public void shoot(final float strikerX, final float strikerY,
                       final float targetX,  final float targetY,
@@ -86,111 +79,155 @@ public class AutoShootService extends AccessibilityService {
 
         float power = Math.min(1.0f, Math.max(0.0f, powerFrac));
 
-        // Compute normalised shot direction (striker → ghost-ball)
         float dx  = targetX - strikerX;
         float dy  = targetY - strikerY;
         float len = (float) Math.sqrt(dx * dx + dy * dy);
-        if (len < 1f) {
-            Log.w(TAG, "shoot: degenerate direction — skip");
-            return;
-        }
-        float nx = dx / len;
-        float ny = dy / len;
+        if (len < 1f) { Log.w(TAG, "shoot: degenerate direction"); return; }
 
-        // ── Phase geometry ────────────────────────────────────────────────────
-
-        // Pre-touch: tiny 8 px forward movement so game recognises striker
-        float preTouchDist = 8f;
-
-        // Flick distance: 60 px (soft) → 90 px (max power)
-        // Kept LOCAL — never leaves the striker area on any screen size.
-        float flickDist = 60f + power * 30f;           // 60–90 px
-
-        // Flick duration: 20 ms (max power) → 35 ms (soft)
-        // Velocity at max power: 90 px / 20 ms = 4 500 px/s (hard shot)
-        // Velocity at soft:      60 px / 35 ms = 1 700 px/s (soft shot)
-        long flickMs = (long)(35f - power * 15f);      // 20–35 ms
-
-        // Coordinates
-        float x0 = strikerX;
-        float y0 = strikerY;
-        float x1 = strikerX + nx * preTouchDist;
-        float y1 = strikerY + ny * preTouchDist;
-        float x2 = strikerX + nx * flickDist;
-        float y2 = strikerY + ny * flickDist;
+        final float nx = dx / len;
+        final float ny = dy / len;
 
         Log.i(TAG, String.format(
-            "shoot v8.6 — pwr=%.2f dir=(%.2f,%.2f) flickDist=%.0f flickMs=%d",
-            power, nx, ny, flickDist, flickMs));
+            "CarromBot shoot — striker=(%.0f,%.0f) dir=(%.2f,%.2f) power=%.2f",
+            strikerX, strikerY, nx, ny, power));
 
-        try {
-            // Stroke 0: pre-touch (18 ms hold, willContinue = true)
-            Path prePath = new Path();
-            prePath.moveTo(x0, y0);
-            prePath.lineTo(x1, y1);
-            GestureDescription.StrokeDescription preStroke =
-                new GestureDescription.StrokeDescription(prePath, 0L, 18L, true);
+        // ── S1: Fast forward flick (80 px, 25 ms) ────────────────────────────
+        boolean s1 = fireGesture(strikerX, strikerY,
+                                  strikerX + nx * 80f,
+                                  strikerY + ny * 80f,
+                                  25L, "S1-FastFlick");
+        if (s1) return;
 
-            // Stroke 1: power flick (willContinue = false → finger-up)
-            Path flickPath = new Path();
-            flickPath.moveTo(x1, y1);
-            flickPath.lineTo(x2, y2);
-            GestureDescription.StrokeDescription flickStroke =
-                preStroke.continueStroke(flickPath, 0L, flickMs, false);
+        // ── S2: Deliberate power swipe (100 px, 50 ms) — 80ms later ──────────
+        handler.postDelayed(() -> {
+            boolean s2 = fireGesture(strikerX, strikerY,
+                                      strikerX + nx * 100f,
+                                      strikerY + ny * 100f,
+                                      50L, "S2-PowerSwipe");
+            if (s2) return;
 
-            GestureDescription.Builder gb = new GestureDescription.Builder();
-            gb.addStroke(preStroke);
-            gb.addStroke(flickStroke);
-
-            boolean ok = dispatchGesture(gb.build(), new GestureResultCallback() {
-                @Override public void onCompleted(GestureDescription g) {
-                    Log.i(TAG, "ENGINE: shot fired OK");
+            // ── S3: Search ±15 px around striker centre — 160ms later ─────────
+            handler.postDelayed(() -> {
+                float[][] offsets = {{0,-15},{0,15},{-15,0},{15,0}};
+                for (float[] off : offsets) {
+                    boolean ok = fireGesture(
+                        strikerX + off[0], strikerY + off[1],
+                        strikerX + off[0] + nx * 80f,
+                        strikerY + off[1] + ny * 80f,
+                        25L, "S3-Offset(" + (int)off[0] + "," + (int)off[1] + ")");
+                    if (ok) return;
                 }
-                @Override public void onCancelled(GestureDescription g) {
-                    Log.w(TAG, "ENGINE: gesture cancelled — retrying in 100 ms");
-                    handler.postDelayed(() -> fireSingleStroke(
-                        x0, y0, x2, y2, flickMs), 100);
-                }
-            }, null);
 
-            if (!ok) {
-                Log.w(TAG, "dispatchGesture busy — fallback single stroke");
-                fireSingleStroke(x0, y0, x2, y2, flickMs);
-            }
+                // ── S4: Root shell input swipe — 250ms later ──────────────────
+                handler.postDelayed(() -> tryRootSwipe(
+                    strikerX, strikerY, nx, ny, power), 90);
 
-        } catch (Exception e) {
-            // continueStroke may throw on older APIs — fall back gracefully
-            Log.w(TAG, "Two-stroke not supported, using single stroke: " + e.getMessage());
-            fireSingleStroke(x0, y0, x2, y2, flickMs);
-        }
+            }, 80);
+        }, 80);
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Core gesture dispatcher
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Single-stroke fallback: one fast swipe from striker centre to flick endpoint.
-     * Used on devices where continueStroke() is unavailable (API < 26 edge cases)
-     * or when the two-stroke gesture is cancelled.
+     * Dispatch a single straight swipe via AccessibilityService.
+     * Returns true if dispatchGesture accepted the request (does NOT guarantee
+     * the game saw it — watch logcat for "onCompleted" vs "onCancelled").
      */
-    private void fireSingleStroke(float fromX, float fromY,
-                                   float toX,   float toY,
-                                   long durationMs) {
+    private boolean fireGesture(float x0, float y0,
+                                 float x1, float y1,
+                                 long durationMs, final String label) {
         Path path = new Path();
-        path.moveTo(fromX, fromY);
-        path.lineTo(toX, toY);
+        path.moveTo(x0, y0);
+        path.lineTo(x1, y1);
 
         GestureDescription.Builder gb = new GestureDescription.Builder();
         gb.addStroke(new GestureDescription.StrokeDescription(path, 0L, durationMs));
 
-        boolean ok = dispatchGesture(gb.build(), new GestureResultCallback() {
+        boolean accepted = dispatchGesture(gb.build(), new GestureResultCallback() {
             @Override public void onCompleted(GestureDescription g) {
-                Log.i(TAG, "Fallback stroke: shot fired OK");
+                lastShotResult = label + ":completed";
+                Log.i(TAG, label + " → onCompleted (gesture delivered)");
             }
             @Override public void onCancelled(GestureDescription g) {
-                Log.w(TAG, "Fallback stroke cancelled");
+                lastShotResult = label + ":cancelled";
+                Log.w(TAG, label + " → onCancelled (game may have ignored it)");
             }
         }, null);
 
-        if (!ok) Log.e(TAG, "fireSingleStroke: dispatchGesture returned false");
+        Log.d(TAG, label + " dispatchGesture=" + accepted
+            + " from=("+Math.round(x0)+","+Math.round(y0)+")"
+            + " to=("+Math.round(x1)+","+Math.round(y1)+")"
+            + " dur="+durationMs+"ms");
+
+        if (!accepted) lastShotResult = label + ":rejected";
+        return accepted;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // S4: Root shell input swipe
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Injects a swipe via `su -c input swipe` (rooted devices only).
+     * Falls back to `input swipe` without su (works on some ADB-enabled shells).
+     * Safe to call on non-rooted devices — it will just log a warning.
+     */
+    private void tryRootSwipe(float sx, float sy, float nx, float ny, float power) {
+        float dist = 80f + power * 40f;
+        float ex   = sx + nx * dist;
+        float ey   = sy + ny * dist;
+        long  dur  = (long)(50f - power * 25f);
+
+        String cmd = String.format("input swipe %.0f %.0f %.0f %.0f %d",
+            sx, sy, ex, ey, dur);
+
+        Log.i(TAG, "S4-Root attempting: " + cmd);
+
+        // Try with root (su)
+        if (execShell("su", "-c", cmd)) {
+            lastShotResult = "S4-Root:ok";
+            Log.i(TAG, "S4-Root: success via su");
+            return;
+        }
+        // Try without su (ADB shell privilege if available)
+        if (execShell("sh", "-c", cmd)) {
+            lastShotResult = "S4-Shell:ok";
+            Log.i(TAG, "S4-Shell: success via sh");
+            return;
+        }
+        lastShotResult = "S4:failed-no-root";
+        Log.w(TAG, "S4: root/shell not available — device may need to be rooted");
+    }
+
+    private boolean execShell(String... cmd) {
+        try {
+            Process p = Runtime.getRuntime().exec(cmd);
+            p.waitFor();
+            return p.exitValue() == 0;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Test fire — called from popup "TEST SHOT" button
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Fire a simple test swipe UP from the given position.
+     * Use this to verify the accessibility service gesture injection works
+     * BEFORE enabling full AutoPlay.
+     */
+    public boolean testFire(float x, float y) {
+        Log.i(TAG, "TEST FIRE at (" + Math.round(x) + "," + Math.round(y) + ")");
+        return fireGesture(x, y, x, y - 80f, 30L, "TEST");
     }
 
     public static boolean isReady() { return INSTANCE != null; }
+    public static String getStatus() {
+        if (INSTANCE == null) return "NOT CONNECTED — Enable in Accessibility Settings";
+        return "CONNECTED — last: " + lastShotResult;
+    }
 }
