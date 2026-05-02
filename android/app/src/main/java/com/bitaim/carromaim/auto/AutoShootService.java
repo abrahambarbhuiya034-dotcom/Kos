@@ -10,44 +10,50 @@ import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 
 /**
- * AutoShootService — v11.0  PROPER PRESS-AND-SLIDE ENGINE
+ * AutoShootService — v12.0 CARROM ENGINE
  *
- * ROOT CAUSE FIX v11.0:
- *   "Only tapping, not sliding" — the previous 40 ms gestures were registering
- *   as TAPS because any gesture shorter than ~120 ms that travels < 10 px is
- *   treated as a tap by Android games.
+ * ═══════════════════════════════════════════════════════════════════
+ * CRITICAL FIX v12.0 — GESTURE DIRECTION WAS BACKWARDS
+ * ═══════════════════════════════════════════════════════════════════
  *
- *   Fix: Multi-phase gesture:
- *     Phase 1 — Press & hold on striker for 80 ms  (willContinue = true)
- *     Phase 2 — Smooth slide 250 px backward in 260 ms (willContinue = false)
- *   Total contact time: 340 ms — impossible to misread as a tap.
+ * Carrom Disc Pool uses FORWARD drag:
+ *   You touch the striker → drag TOWARD the target → release
+ *   Power = drag distance.  Angle = drag direction.
  *
- *   Fallback for API < 26: single 320 ms stroke over 250 px.
+ * Previous versions used SLINGSHOT (backward) which is wrong for
+ * this game. Fixed: S1 is now FORWARD toward target.
  *
- * Strategy order
- * ─────────────────────────────────────────────────────────────────────────
- *  S1  SLINGSHOT hold+slide  backward 250 px  (340 ms total)  [PRIMARY]
- *  S2  FORWARD   hold+slide  forward  250 px  (340 ms total)
- *  S3  SLINGSHOT single-stroke backward 250 px (320 ms)       [API<26 safe]
- *  S4  Root shell `input swipe`                               [rooted only]
+ * Strategy waterfall (tries each in sequence, stops on first success):
  *
- * Watch: adb logcat -s CarromBot
+ *  S1  FORWARD smooth  — hold 80 ms + smooth multi-point slide 260 ms
+ *                         toward target   [PRIMARY — correct for CarromDP]
+ *  S2  FORWARD long    — single 320 ms stroke toward target (API<26 safe)
+ *  S3  SLINGSHOT       — backward 300 ms  (for pull-back style games)
+ *  S4  Root/ADB shell  — `input swipe`   (rooted devices)
+ *
+ * Monitor: adb logcat -s CarromEngine
  */
 public class AutoShootService extends AccessibilityService {
 
-    private static final String TAG = "CarromBot";
+    private static final String TAG = "CarromEngine";
+
+    /** Gesture travel distance in pixels. 280px = strong directional drag. */
+    private static final float DRAG_DIST_BASE  = 240f;
+    private static final float DRAG_DIST_BONUS = 80f;  // added at full power
 
     public static volatile AutoShootService INSTANCE;
-    public static volatile String lastShotResult = "none";
+    public static volatile String           lastResult = "none";
 
-    private final Handler handler = new Handler(Looper.getMainLooper());
+    private final Handler h = new Handler(Looper.getMainLooper());
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     @Override
     public void onServiceConnected() {
         super.onServiceConnected();
-        INSTANCE = this;
-        lastShotResult = "connected";
-        Log.i(TAG, "=== CarromBot v11.0 CONNECTED — press-and-slide engine ready ===");
+        INSTANCE   = this;
+        lastResult = "CONNECTED";
+        Log.i(TAG, "=== CarromEngine v12.0 CONNECTED — forward-drag engine ready ===");
     }
 
     @Override public void onAccessibilityEvent(AccessibilityEvent e) {}
@@ -56,90 +62,102 @@ public class AutoShootService extends AccessibilityService {
     @Override
     public void onDestroy() {
         super.onDestroy();
-        handler.removeCallbacksAndMessages(null);
-        INSTANCE = null;
-        lastShotResult = "disconnected";
+        h.removeCallbacksAndMessages(null);
+        INSTANCE   = null;
+        lastResult = "DISCONNECTED";
+        Log.i(TAG, "CarromEngine disconnected");
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // shoot() — called by FloatingOverlayService once board is stable
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════════
+    // shoot()  — called by the engine once a stable board is detected
+    //
+    //  strikerX/Y  screen coordinates of the striker disk centre
+    //  targetX/Y   screen coordinates of the ghost-ball contact point
+    //  powerFrac   0.0–1.0 shot power
+    // ═════════════════════════════════════════════════════════════════════════
 
     public void shoot(final float strikerX, final float strikerY,
                       final float targetX,  final float targetY,
                       final float powerFrac) {
 
-        float power = Math.min(1.0f, Math.max(0.0f, powerFrac));
+        float power = Math.max(0f, Math.min(1f, powerFrac));
 
         float dx  = targetX - strikerX;
         float dy  = targetY - strikerY;
         float len = (float) Math.sqrt(dx * dx + dy * dy);
-        if (len < 1f) { Log.w(TAG, "shoot: zero direction"); return; }
+        if (len < 1f) { Log.w(TAG, "shoot: degenerate direction — skipped"); return; }
 
-        final float fwdX = dx / len;
+        // Unit vectors
+        final float fwdX = dx / len;   // TOWARD target  (correct for CarromDP)
         final float fwdY = dy / len;
-        final float bkX  = -fwdX;  // backward = slingshot direction
+        final float bkX  = -fwdX;      // AWAY from target (slingshot fallback)
         final float bkY  = -fwdY;
 
-        float dist = 200f + power * 50f;  // 200–250 px
+        float dragDist = DRAG_DIST_BASE + power * DRAG_DIST_BONUS;
 
         Log.i(TAG, String.format(
-            "v11 shoot — striker=(%.0f,%.0f) back=(%.2f,%.2f) dist=%.0f pwr=%.2f",
-            strikerX, strikerY, bkX, bkY, dist, power));
+            "v12 SHOOT — striker=(%.0f,%.0f) dir=(%.2f,%.2f) dist=%.0f pwr=%.2f",
+            strikerX, strikerY, fwdX, fwdY, dragDist, power));
 
-        // ── S1: PRIMARY — Press-hold + slingshot slide backward ──────────────
-        boolean s1 = fireHoldSlide(strikerX, strikerY,
-                                    strikerX + bkX * dist,
-                                    strikerY + bkY * dist,
-                                    "S1-HoldSling");
+        // ── S1: FORWARD smooth hold+slide (PRIMARY) ───────────────────────────
+        float ex = strikerX + fwdX * dragDist;
+        float ey = strikerY + fwdY * dragDist;
+
+        boolean s1 = fireSmooth(strikerX, strikerY, ex, ey, "S1-FwdSmooth");
         if (s1) return;
 
-        // ── S2: Forward hold+slide (in case game uses forward swipe) — 90ms ─
-        handler.postDelayed(() -> {
-            boolean s2 = fireHoldSlide(strikerX, strikerY,
-                                        strikerX + fwdX * dist,
-                                        strikerY + fwdY * dist,
-                                        "S2-HoldFwd");
+        // ── S2: FORWARD single long stroke ────────────────────────────────────
+        h.postDelayed(() -> {
+            boolean s2 = fireSingle(strikerX, strikerY, ex, ey, 320L, "S2-FwdLong");
             if (s2) return;
 
-            // ── S3: Single long slingshot stroke (API<26 fallback) — 90ms ──
-            handler.postDelayed(() -> {
-                boolean s3 = fireSingleStroke(strikerX, strikerY,
-                                              strikerX + bkX * dist,
-                                              strikerY + bkY * dist,
-                                              320L, "S3-LongSling");
+            // ── S3: SLINGSHOT backward (fallback for pull-back games) ─────────
+            h.postDelayed(() -> {
+                float bx = strikerX + bkX * dragDist;
+                float by = strikerY + bkY * dragDist;
+                boolean s3 = fireSmooth(strikerX, strikerY, bx, by, "S3-Slingshot");
                 if (s3) return;
 
-                // ── S4: Root shell — 90ms ────────────────────────────────
-                handler.postDelayed(() ->
-                    tryRootSwipe(strikerX, strikerY, bkX, bkY, power), 90);
-
+                // ── S4: Root shell ────────────────────────────────────────────
+                h.postDelayed(() -> rootSwipe(strikerX, strikerY, ex, ey), 90);
             }, 90);
         }, 90);
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // Multi-phase: Press-hold 80 ms → Slide 260 ms  (API 26+)
-    // Falls back to single long stroke if API < 26 or build fails.
-    // ─────────────────────────────────────────────────────────────────────────
+    // ═════════════════════════════════════════════════════════════════════════
+    // fireSmooth — Phase 1: hold 80ms | Phase 2: smooth multi-point slide 260ms
+    //
+    // The multi-point path makes the gesture look like a real finger drag
+    // (velocity profile) rather than an instant jump.  Games that inspect
+    // intermediate move events (Carrom Disc Pool does) will correctly register
+    // this as a power-drag rather than a tap.
+    // ═════════════════════════════════════════════════════════════════════════
 
-    private boolean fireHoldSlide(float sx, float sy, float ex, float ey, String label) {
+    private boolean fireSmooth(float sx, float sy, float ex, float ey, String label) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            // API 24–25: continueStroke not available, use long single stroke
-            return fireSingleStroke(sx, sy, ex, ey, 320L, label + "-fallback");
+            // API 24–25: continueStroke not available — fall through to fireSingle
+            return fireSingle(sx, sy, ex, ey, 320L, label + "-api25fb");
         }
         try {
-            // Phase 1: touch down, hold 80 ms at striker (no movement)
+            // Phase 1: press and hold 80 ms at striker (no movement)
             Path holdPath = new Path();
             holdPath.moveTo(sx, sy);
             holdPath.lineTo(sx, sy);
             GestureDescription.StrokeDescription hold =
                 new GestureDescription.StrokeDescription(holdPath, 0L, 80L, true);
 
-            // Phase 2: continue from same position, slide to end over 260 ms
+            // Phase 2: smooth quad-bezier slide over 260 ms
+            // Add a mid-point to create a smooth curved path —
+            // this mimics human finger acceleration and gives the game
+            // the realistic velocity profile it needs to register as a drag.
             Path slidePath = new Path();
             slidePath.moveTo(sx, sy);
-            slidePath.lineTo(ex, ey);
+            float midX = (sx + ex) / 2f;
+            float midY = (sy + ey) / 2f;
+            slidePath.quadTo(
+                midX - (ey - sy) * 0.05f,
+                midY + (ex - sx) * 0.05f,
+                ex, ey);
             GestureDescription.StrokeDescription slide =
                 hold.continueStroke(slidePath, 0L, 260L, false);
 
@@ -150,59 +168,59 @@ public class AutoShootService extends AccessibilityService {
 
             boolean ok = dispatchGesture(gesture, new GestureResultCallback() {
                 @Override public void onCompleted(GestureDescription g) {
-                    lastShotResult = label + ":COMPLETED";
-                    Log.i(TAG, label + " COMPLETED — striker should have moved!");
+                    lastResult = label + ":OK";
+                    Log.i(TAG, "*** " + label + " COMPLETED — striker should move! ***");
                 }
                 @Override public void onCancelled(GestureDescription g) {
-                    lastShotResult = label + ":CANCELLED";
-                    Log.w(TAG, label + " CANCELLED — check FLAG_SECURE or wrong coords");
+                    lastResult = label + ":CANCELLED";
+                    Log.w(TAG, label + " CANCELLED (game may block accessibility input)");
                 }
             }, null);
 
             Log.d(TAG, label + " dispatch=" + ok
-                + " from=(" + Math.round(sx) + "," + Math.round(sy) + ")"
-                + " to=(" + Math.round(ex) + "," + Math.round(ey) + ")"
-                + " [hold80ms + slide260ms = 340ms total]");
+                + " (" + Math.round(sx) + "," + Math.round(sy) + ")"
+                + "→(" + Math.round(ex) + "," + Math.round(ey) + ")"
+                + " [hold80+slide260=340ms]");
 
-            if (!ok) lastShotResult = label + ":REJECTED";
+            if (!ok) lastResult = label + ":REJECTED";
             return ok;
+
         } catch (Exception e) {
             Log.e(TAG, label + " EXCEPTION: " + e.getMessage());
-            return fireSingleStroke(sx, sy, ex, ey, 320L, label + "-exFallback");
+            return fireSingle(sx, sy, ex, ey, 320L, label + "-exFB");
         }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Single long stroke — works on all API levels
+    // fireSingle — single long stroke, all API levels
     // ─────────────────────────────────────────────────────────────────────────
 
-    private boolean fireSingleStroke(float sx, float sy, float ex, float ey,
-                                      long durationMs, String label) {
+    private boolean fireSingle(float sx, float sy, float ex, float ey,
+                                long durationMs, String label) {
         try {
             Path path = new Path();
             path.moveTo(sx, sy);
+            // Add intermediate waypoint for better velocity profile
+            path.lineTo((sx * 2 + ex) / 3f, (sy * 2 + ey) / 3f);
+            path.lineTo((sx + ex * 2) / 3f, (sy + ey * 2) / 3f);
             path.lineTo(ex, ey);
 
-            GestureDescription gesture = new GestureDescription.Builder()
+            GestureDescription g = new GestureDescription.Builder()
                 .addStroke(new GestureDescription.StrokeDescription(path, 0L, durationMs))
                 .build();
 
-            boolean ok = dispatchGesture(gesture, new GestureResultCallback() {
-                @Override public void onCompleted(GestureDescription g) {
-                    lastShotResult = label + ":COMPLETED";
-                    Log.i(TAG, label + " COMPLETED");
-                }
-                @Override public void onCancelled(GestureDescription g) {
-                    lastShotResult = label + ":CANCELLED";
-                    Log.w(TAG, label + " CANCELLED");
-                }
+            boolean ok = dispatchGesture(g, new GestureResultCallback() {
+                @Override public void onCompleted(GestureDescription gd) {
+                    lastResult = label + ":OK"; Log.i(TAG, label + " COMPLETED"); }
+                @Override public void onCancelled(GestureDescription gd) {
+                    lastResult = label + ":CANCELLED"; Log.w(TAG, label + " CANCELLED"); }
             }, null);
 
             Log.d(TAG, label + " dispatch=" + ok + " dur=" + durationMs + "ms"
                 + " (" + Math.round(sx) + "," + Math.round(sy) + ")"
-                + "->(" + Math.round(ex) + "," + Math.round(ey) + ")");
+                + "→(" + Math.round(ex) + "," + Math.round(ey) + ")");
 
-            if (!ok) lastShotResult = label + ":REJECTED";
+            if (!ok) lastResult = label + ":REJECTED";
             return ok;
         } catch (Exception e) {
             Log.e(TAG, label + " EXCEPTION: " + e.getMessage());
@@ -211,37 +229,40 @@ public class AutoShootService extends AccessibilityService {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Test fire — popup TEST SHOT button
+    // testFire — called by TEST SHOT button
+    // Fires a clear forward swipe so you can see the striker move
     // ─────────────────────────────────────────────────────────────────────────
 
     public boolean testFire(float x, float y) {
-        Log.i(TAG, "TEST FIRE hold+slide DOWN 200px at (" + Math.round(x) + "," + Math.round(y) + ")");
-        return fireHoldSlide(x, y, x, y + 200f, "TEST-HoldSlide");
+        Log.i(TAG, "TEST FIRE — forward slide UP 250px from ("
+            + Math.round(x) + "," + Math.round(y) + ")");
+        // Shoot straight up (toward coins above striker)
+        return fireSmooth(x, y, x, y - 250f, "TEST-FwdUp");
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // Root shell fallback
+    // rootSwipe — shell fallback (rooted/ADB devices)
     // ─────────────────────────────────────────────────────────────────────────
 
-    private void tryRootSwipe(float sx, float sy, float bkX, float bkY, float power) {
-        float dist = 200f + power * 50f;
-        float ex = sx + bkX * dist;
-        float ey = sy + bkY * dist;
-        String cmd = String.format("input swipe %.0f %.0f %.0f %.0f 320", sx, sy, ex, ey);
+    private void rootSwipe(float sx, float sy, float ex, float ey) {
+        String cmd = String.format("input swipe %.0f %.0f %.0f %.0f 300", sx, sy, ex, ey);
         Log.i(TAG, "S4-Root: " + cmd);
         try {
             Process p = Runtime.getRuntime().exec(new String[]{"su", "-c", cmd});
-            int exit = p.waitFor();
-            lastShotResult = "S4-Root:exit=" + exit;
-        } catch (Exception e) {
-            try { Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd}); lastShotResult = "S4-sh:sent"; }
-            catch (Exception e2) { lastShotResult = "S4:no-root"; Log.w(TAG, "No root available"); }
+            int rc = p.waitFor();
+            lastResult = "S4-root:rc=" + rc;
+            Log.i(TAG, "S4-root exit=" + rc);
+        } catch (Exception e1) {
+            try {
+                Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd});
+                lastResult = "S4-sh:sent";
+            } catch (Exception e2) {
+                lastResult = "S4:no-shell";
+                Log.w(TAG, "S4: no shell access — device is not rooted");
+            }
         }
     }
 
     public static boolean isReady()   { return INSTANCE != null; }
-    public static String  getStatus() {
-        if (INSTANCE == null) return "NOT CONNECTED";
-        return "CONNECTED last=" + lastShotResult;
-    }
+    public static String  getStatus() { return INSTANCE == null ? "NOT CONNECTED" : "OK last=" + lastResult; }
 }
