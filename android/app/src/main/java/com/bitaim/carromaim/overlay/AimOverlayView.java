@@ -19,27 +19,15 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * AimOverlayView — v8.2 VISUAL OVERHAUL
+ * AimOverlayView — v8.4
  *
- * Visual style matched to reference video:
- *
- *   ┌────────────────────────────────────────────────────────┐
- *   │  Each shot drawn as TWO connected segments:            │
- *   │   Segment A:  striker centre → coin contact point      │
- *   │               BRIGHT WHITE glow + solid core           │
- *   │   Segment B:  coin centre → pocket centre              │
- *   │               DIM WHITE glow + dark solid core         │
- *   │                                                        │
- *   │  Glow effect: draw each line TWICE —                   │
- *   │    pass 1: wide (14 dp), semi-transparent → halo       │
- *   │    pass 2: narrow (5 dp), fully opaque   → core        │
- *   │                                                        │
- *   │  Best shot (rank 0): brightest / widest                │
- *   │  Lower ranks: progressively thinner / dimmer           │
- *   │                                                        │
- *   │  Ghost-ball contact circle: small, subtle              │
- *   │  Board outline, coins, striker: unchanged              │
- *   └────────────────────────────────────────────────────────┘
+ * Visual changes vs v8.3:
+ *  - Removed coin-circle drawing (no more transparent ghost discs cluttering board)
+ *  - Removed full aim-lines from striker position
+ *  - NEW: directional arrow drawn at the LAST POINT of each shot (ghost-ball endpoint)
+ *    The arrow points in the direction of travel (striker → ghost).
+ *  - Coin→pocket line kept (shows where the targeted coin will travel)
+ *  - Best shot arrow: bright gold; lower ranks: progressively dimmer cyan/white
  */
 public class AimOverlayView extends View {
 
@@ -53,41 +41,53 @@ public class AimOverlayView extends View {
     private static final float EMA_ALPHA       = 0.25f;
     private static final float CACHE_THRESH_PX = 12f;
 
-    // ── Glow-line visual parameters ───────────────────────────────────────────
+    // ── Arrow visual parameters per rank ──────────────────────────────────────
 
-    /** Glow halo widths per rank (dp). Widest = best shot. */
-    private static final float[] GLOW_WIDTH  = { 16f, 13f, 11f, 9f, 7f };
-    /** Core line widths per rank (dp). */
-    private static final float[] CORE_WIDTH  = {  5f,  4f,  3.5f, 3f, 2.5f };
-    /** Glow alpha per rank (0-255). */
-    private static final int[]   GLOW_ALPHA  = { 70, 55, 42, 32, 22 };
-    /** Core alpha per rank (0-255). */
-    private static final int[]   CORE_ALPHA  = { 255, 220, 185, 150, 110 };
+    /** Arrow head size multiplier relative to striker radius. */
+    private static final float[] ARROW_SCALE = { 1.5f, 1.2f, 1.0f, 0.85f, 0.70f };
+    /** Glow ring alpha per rank. */
+    private static final int[]   GLOW_ALPHA  = { 80,  60,  45,  32, 22 };
+    /** Arrow fill alpha per rank. */
+    private static final int[]   FILL_ALPHA  = { 255, 210, 170, 130, 90 };
+    /** Glow ring width per rank (dp). */
+    private static final float[] GLOW_WIDTH  = { 18f, 14f, 11f, 9f, 7f };
+    /** Stem line width per rank (dp). */
+    private static final float[] STEM_WIDTH  = {  4f,  3f,  2.5f, 2f, 1.5f };
 
-    // Striker→ghost: bright white glow
-    private static final int STRIKER_GLOW_COLOR = 0xFFFFFFFF;
-    // Striker→ghost core: pure white
-    private static final int STRIKER_CORE_COLOR = 0xFFFFFFFF;
-    // Coin→pocket glow: white tinted
-    private static final int COIN_GLOW_COLOR    = 0xFFCCDDFF;
-    // Coin→pocket core: dark/near-black for high contrast on wooden board
-    private static final int COIN_CORE_COLOR    = 0xFF1A1A2E;
+    // Best shot: gold; others: cyan→white gradient
+    private static final int[] ARROW_COLORS = {
+        0xFFFFD700,   // rank 0 — gold
+        0xFF00E5FF,   // rank 1 — cyan
+        0xFFFFFFFF,   // rank 2 — white
+        0xFFBBBBFF,   // rank 3 — lavender
+        0xFF888888,   // rank 4 — grey
+    };
+
+    // Coin→pocket line paints
+    private static final int COIN_GLOW_COLOR = 0xFFCCDDFF;
+    private static final int COIN_CORE_COLOR = 0xFF1A1A2E;
+    private static final float[] COIN_GLOW_W = { 14f, 11f, 9f, 7f, 5f };
+    private static final float[] COIN_CORE_W = {  4f,  3f,  2.5f, 2f, 1.5f };
+    private static final int[]   COIN_GLOW_A = { 55,  42, 32, 24, 16 };
+    private static final int[]   COIN_CORE_A = { 255, 220, 185, 150, 110 };
 
     // ── Per-rank paints ───────────────────────────────────────────────────────
 
-    private final Paint[] strikerGlowPaints = new Paint[MAX_LINES];
-    private final Paint[] strikerCorePaints = new Paint[MAX_LINES];
-    private final Paint[] coinGlowPaints    = new Paint[MAX_LINES];
-    private final Paint[] coinCorePaints    = new Paint[MAX_LINES];
+    private final Paint[] arrowGlowPaints = new Paint[MAX_LINES];   // glow ring
+    private final Paint[] arrowFillPaints = new Paint[MAX_LINES];   // filled arrowhead
+    private final Paint[] stemPaints      = new Paint[MAX_LINES];   // tail stem
+    private final Paint[] coinGlowPaints  = new Paint[MAX_LINES];
+    private final Paint[] coinCorePaints  = new Paint[MAX_LINES];
 
-    // ── Board / coin / misc paints ────────────────────────────────────────────
+    // ── Board / striker / misc paints ─────────────────────────────────────────
 
     private final Paint boardPaint, boardDemoPaint;
-    private final Paint strikerRingPaint;
-    private final Paint coinOutlinePaint, pocketFill;
-    private final Paint blackFill, whiteFill, redFill;
-    private final Paint ghostDotPaint;
+    private final Paint strikerRingPaint, strikerFillPaint;
+    private final Paint pocketFill;
     private final Paint watermarkPaint;
+
+    // Reused Path to avoid per-frame allocation
+    private final Path arrowPath = new Path();
 
     private final TrajectorySimulator simulator = new TrajectorySimulator();
     private String    shotMode   = MODE_ALL;
@@ -96,13 +96,13 @@ public class AimOverlayView extends View {
     private boolean   hasLiveData = false;
     private final float dp;
 
-    // ── Trajectory cache ─────────────────────────────────────────────────────
+    // ── Trajectory cache ──────────────────────────────────────────────────────
     private float cacheStrikerX  = Float.NaN;
     private float cacheStrikerY  = Float.NaN;
     private int   cacheCoinsHash = -1;
     private List<CarromAI.AiShot> cachedShots = new ArrayList<>();
 
-    // ── BestShot ─────────────────────────────────────────────────────────────
+    // ── BestShot ──────────────────────────────────────────────────────────────
     public static class BestShot {
         public final float strikerX, strikerY, targetX, targetY, powerFrac;
         public BestShot(float sx, float sy, float tx, float ty, float pw) {
@@ -123,7 +123,7 @@ public class AimOverlayView extends View {
             aiShot.powerFrac);
     }
 
-    // ── AutoPlay swipe listener ───────────────────────────────────────────────
+    // ── AutoPlay swipe listener ────────────────────────────────────────────────
     public interface AutoplaySwipeListener {
         void onPerformSwipe(float fromX, float fromY,
                             float toX,   float toY,
@@ -140,16 +140,25 @@ public class AimOverlayView extends View {
         super(context);
         dp = context.getResources().getDisplayMetrics().density;
 
-        // Build per-rank paints
+        // Per-rank arrow paints
         for (int i = 0; i < MAX_LINES; i++) {
-            strikerGlowPaints[i] = makeStroke(STRIKER_GLOW_COLOR,
-                    GLOW_WIDTH[i] * dp, GLOW_ALPHA[i]);
-            strikerCorePaints[i] = makeStroke(STRIKER_CORE_COLOR,
-                    CORE_WIDTH[i] * dp, CORE_ALPHA[i]);
-            coinGlowPaints[i]    = makeStroke(COIN_GLOW_COLOR,
-                    GLOW_WIDTH[i] * dp, (int)(GLOW_ALPHA[i] * 0.7f));
-            coinCorePaints[i]    = makeStroke(COIN_CORE_COLOR,
-                    CORE_WIDTH[i] * dp, CORE_ALPHA[i]);
+            int col = ARROW_COLORS[i];
+
+            // Glow ring (stroke)
+            arrowGlowPaints[i] = makeStroke(col, GLOW_WIDTH[i] * dp, GLOW_ALPHA[i]);
+
+            // Arrow fill (solid fill for arrowhead triangle)
+            arrowFillPaints[i] = makeFill(col);
+            arrowFillPaints[i].setAlpha(FILL_ALPHA[i]);
+
+            // Stem line (stroke)
+            stemPaints[i] = makeStroke(col, STEM_WIDTH[i] * dp, FILL_ALPHA[i]);
+
+            // Coin→pocket
+            coinGlowPaints[i] = makeStroke(COIN_GLOW_COLOR,
+                    COIN_GLOW_W[i] * dp, COIN_GLOW_A[i]);
+            coinCorePaints[i] = makeStroke(COIN_CORE_COLOR,
+                    COIN_CORE_W[i] * dp, COIN_CORE_A[i]);
         }
 
         // Board outline
@@ -158,18 +167,12 @@ public class AimOverlayView extends View {
         boardDemoPaint = makeStroke(0x44FFD700, 1.0f * dp, 255);
         boardDemoPaint.setPathEffect(new DashPathEffect(new float[]{4*dp, 8*dp}, 0));
 
-        // Striker ring — gold outline, no fill
+        // Striker
         strikerRingPaint = makeStroke(0xFFFFD700, 2.5f * dp, 255);
+        strikerFillPaint = makeFill(0x99EEEEEE);
 
-        // Coin paints
-        coinOutlinePaint = makeStroke(0x99FFFFFF, 1.2f * dp, 255);
-        pocketFill       = makeFill(0xAA2ECC71);
-        blackFill        = makeFill(0xBB101010);
-        whiteFill        = makeFill(0xBBEEEEEE);
-        redFill          = makeFill(0xBBFF3344);
-
-        // Ghost-ball contact dot
-        ghostDotPaint = makeStroke(0xCCFFFFFF, 2.0f * dp, 255);
+        // Pocket fill
+        pocketFill = makeFill(0xAA2ECC71);
 
         // Watermark
         watermarkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -210,8 +213,6 @@ public class AimOverlayView extends View {
     }
 
     private void rebuildCacheIfNeeded() {
-        // Use the raw DETECTED state for the cache key — the smoothed position
-        // barely moves with EMA and would prevent cache from ever refreshing.
         GameState raw = detected;
         GameState s   = smoothed != null ? smoothed : detected;
         if (s == null || s.striker == null || raw == null) { invalidateCache(); return; }
@@ -220,8 +221,8 @@ public class AimOverlayView extends View {
         int   ch = coinsHash(raw);
 
         boolean strikerMoved = Float.isNaN(cacheStrikerX) ||
-            (sx - cacheStrikerX) * (sx - cacheStrikerX) +
-            (sy - cacheStrikerY) * (sy - cacheStrikerY) >= CACHE_THRESH_PX * CACHE_THRESH_PX;
+            (sx - cacheStrikerX)*(sx - cacheStrikerX) +
+            (sy - cacheStrikerY)*(sy - cacheStrikerY) >= CACHE_THRESH_PX * CACHE_THRESH_PX;
         boolean coinsChanged = (ch != cacheCoinsHash);
 
         if (!strikerMoved && !coinsChanged) return;
@@ -229,10 +230,8 @@ public class AimOverlayView extends View {
         cacheStrikerX  = sx;
         cacheStrikerY  = sy;
         cacheCoinsHash = ch;
+        cachedShots    = computeFilteredShots(s);
 
-        cachedShots = computeFilteredShots(s);
-
-        // Update best-shot for autoplay
         if (!cachedShots.isEmpty()) {
             CarromAI.AiShot best = cachedShots.get(0);
             float dx = best.ghostPos.x - s.striker.pos.x;
@@ -244,7 +243,6 @@ public class AimOverlayView extends View {
         }
     }
 
-    /** Fast hash combining coin count + round positions. */
     private static int coinsHash(GameState s) {
         int h = s.coins.size() * 31;
         for (com.bitaim.carromaim.cv.Coin c : s.coins) {
@@ -348,16 +346,6 @@ public class AimOverlayView extends View {
 
         RectF board = s.board;
 
-        // Slightly expanded clip rect for segment A (striker→ghost).
-        // The ghost can legitimately land just outside the board boundary when
-        // targeting edge coins. Without expansion, valid shots get fully clipped.
-        RectF boardExpanded = null;
-        if (board != null) {
-            float margin = s.striker.radius * 1.5f;
-            boardExpanded = new RectF(board.left  - margin, board.top    - margin,
-                                      board.right + margin, board.bottom + margin);
-        }
-
         // Board outline
         if (board != null) {
             canvas.drawRect(board, hasLiveData ? boardPaint : boardDemoPaint);
@@ -370,63 +358,105 @@ public class AimOverlayView extends View {
         for (PointF p : s.pockets)
             canvas.drawCircle(p.x, p.y, pocketR, pocketFill);
 
+        // NOTE: Coins are intentionally NOT drawn — they cluttered the board
+        // with transparent ghost circles. Only the aim arrows are shown.
+
         List<CarromAI.AiShot> shots = cachedShots;
 
-        // ── Draw all shot lines back-to-front (rank MAX-1 first, rank 0 last) ──
+        // Expanded clip rect for arrows near board edge
+        RectF boardExpanded = null;
+        if (board != null) {
+            float margin = s.striker.radius * 2f;
+            boardExpanded = new RectF(board.left-margin, board.top-margin,
+                                      board.right+margin, board.bottom+margin);
+        }
+
+        // Draw shots back-to-front (rank MAX-1 first, rank 0 last = on top)
         for (int rank = shots.size() - 1; rank >= 0; rank--) {
             CarromAI.AiShot shot = shots.get(rank);
 
             float sX = s.striker.pos.x, sY = s.striker.pos.y;
             float gX = shot.ghostPos.x,  gY = shot.ghostPos.y;
 
-            // ── Segment A: striker centre → ghost-ball contact point ──────────
-            // Use the expanded board rect so edge-coin shots are not clipped.
-            // Pass 1: wide glow halo
-            drawLineSafe(canvas, sX, sY, gX, gY, strikerGlowPaints[rank], boardExpanded);
-            // Pass 2: narrow bright core
-            drawLineSafe(canvas, sX, sY, gX, gY, strikerCorePaints[rank], boardExpanded);
+            // Direction: striker → ghost (normalised)
+            float dx = gX - sX, dy = gY - sY;
+            float len = (float) Math.sqrt(dx*dx + dy*dy);
+            if (len < 1f) continue;
+            float nx = dx/len, ny = dy/len;
 
-            // ── Segment B: coin centre → pocket ───────────────────────────────
+            // Arrow size: proportional to striker radius
+            float arrowSize = s.striker.radius * ARROW_SCALE[rank];
+
+            // ── Arrow at ghost position (the "last point" of the striker path) ──
+            if (isFinite(gX, gY)) {
+                drawShotArrow(canvas, gX, gY, nx, ny, arrowSize, rank);
+            }
+
+            // ── Coin→pocket trajectory line ───────────────────────────────────
             if (shot.coin != null && shot.pocket != null) {
                 float cX = shot.coin.pos.x, cY = shot.coin.pos.y;
                 float pX = shot.pocket.x,   pY = shot.pocket.y;
-
-                // Clip coin→pocket line to actual board (this path stays inside).
-                // Pass 1: wide glow halo
                 drawLineSafe(canvas, cX, cY, pX, pY, coinGlowPaints[rank], board);
-                // Pass 2: narrow dark core
                 drawLineSafe(canvas, cX, cY, pX, pY, coinCorePaints[rank], board);
             }
-
-            // ── Ghost-ball dot at contact point (subtle circle) ───────────────
-            float ghostR = s.striker.radius * 0.55f;
-            if (rank == 0) {
-                // Best shot: slightly larger, brighter ring
-                canvas.drawCircle(gX, gY, ghostR * 1.2f, ghostDotPaint);
-            } else {
-                ghostDotPaint.setAlpha((int)(255 * (1f - rank * 0.18f)));
-                canvas.drawCircle(gX, gY, ghostR, ghostDotPaint);
-                ghostDotPaint.setAlpha(255);
-            }
         }
 
-        // ── Coins ─────────────────────────────────────────────────────────────
-        for (Coin c : s.coins) {
-            Paint fill = (c.color == Coin.COLOR_BLACK) ? blackFill
-                       : (c.color == Coin.COLOR_RED)   ? redFill
-                                                       : whiteFill;
-            canvas.drawCircle(c.pos.x, c.pos.y, c.radius, fill);
-            canvas.drawCircle(c.pos.x, c.pos.y, c.radius, coinOutlinePaint);
-        }
-
-        // ── Striker (always on top) ───────────────────────────────────────────
-        canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, whiteFill);
+        // ── Striker marker (always on top) ────────────────────────────────────
+        canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, strikerFillPaint);
         canvas.drawCircle(s.striker.pos.x, s.striker.pos.y, s.striker.radius, strikerRingPaint);
+    }
+
+    /**
+     * Draw a directional arrow at position (cx, cy) pointing in direction (nx, ny).
+     *
+     * The arrow consists of:
+     *   1. A soft glow ring centred at (cx, cy)
+     *   2. A filled triangle (arrowhead) with tip pointing in (nx, ny)
+     *   3. A short stem line going backward (opposite to direction)
+     *
+     * This replaces the old "line from striker to ghost" — now only the endpoint
+     * carries the visual indicator, keeping the board uncluttered.
+     */
+    private void drawShotArrow(Canvas canvas,
+                                float cx, float cy,
+                                float nx, float ny,
+                                float size, int rank) {
+        // Perpendicular unit vector
+        float px = -ny, py = nx;
+
+        // ── 1. Glow ring at arrow centre ──────────────────────────────────────
+        canvas.drawCircle(cx, cy, size * 1.0f, arrowGlowPaints[rank]);
+
+        // ── 2. Arrowhead triangle ─────────────────────────────────────────────
+        //   Tip: forward in direction (nx,ny) from centre
+        //   Base: behind centre, spread by halfWidth
+        float tipX  = cx + nx * size * 1.1f;
+        float tipY  = cy + ny * size * 1.1f;
+        float halfW = size * 0.65f;
+        float baseX = cx - nx * size * 0.4f;
+        float baseY = cy - ny * size * 0.4f;
+        float b1x   = baseX + px * halfW;
+        float b1y   = baseY + py * halfW;
+        float b2x   = baseX - px * halfW;
+        float b2y   = baseY - py * halfW;
+
+        arrowPath.reset();
+        arrowPath.moveTo(tipX, tipY);
+        arrowPath.lineTo(b1x, b1y);
+        arrowPath.lineTo(b2x, b2y);
+        arrowPath.close();
+        canvas.drawPath(arrowPath, arrowFillPaints[rank]);
+
+        // ── 3. Stem line going backward from arrow base ───────────────────────
+        //   Makes it clear which direction the shot comes from
+        float stemLen = size * 2.2f;
+        float stemEndX = cx - nx * stemLen;
+        float stemEndY = cy - ny * stemLen;
+        canvas.drawLine(baseX, baseY, stemEndX, stemEndY, stemPaints[rank]);
     }
 
     // ── Draw helpers ──────────────────────────────────────────────────────────
 
-    /** Draw a single line, Cohen-Sutherland clipped to the board rect. */
     private void drawLineSafe(Canvas canvas,
                                float x0, float y0, float x1, float y1,
                                Paint p, RectF board) {
@@ -439,10 +469,6 @@ public class AimOverlayView extends View {
         }
     }
 
-    /**
-     * Cohen-Sutherland line clipping against a rectangle.
-     * Returns {x0, y0, x1, y1} of the visible segment, or null if fully outside.
-     */
     private static float[] clipLineToRect(float x0, float y0, float x1, float y1, RectF r) {
         int code0 = outcode(x0, y0, r);
         int code1 = outcode(x1, y1, r);
