@@ -66,13 +66,13 @@ public class FloatingOverlayService extends Service {
     // ── Responsiveness tuning ─────────────────────────────────────────────────
     /**
      * Frames that must be stable before autoplay fires.
-     * Reduced 10 → 6 so the shot fires ~200 ms sooner once the board settles.
+     * Reduced 10 -> 6 so the shot fires ~200 ms sooner once the board settles.
      */
     private static final int   STABLE_FRAMES_NEEDED = 6;
     private static final int   PREFETCH_FRAMES      = 2;
     /**
      * Maximum striker movement (px) counted as "stable".
-     * Raised 20 → 40 px so CV-detection jitter (typically 5–20 px/frame)
+     * Raised 20 -> 40 px so CV-detection jitter (typically 5–20 px/frame)
      * does not reset the stability counter. Only genuine striker movement
      * (>40 px) will reset.
      */
@@ -330,12 +330,7 @@ public class FloatingOverlayService extends Service {
         boolean accessOk  = AutoShootService.isReady();
         boolean captureOk = com.bitaim.carromaim.capture.ScreenCaptureService.INSTANCE != null;
         TextView statusView = new TextView(this);
-        statusView.setText(
-            (accessOk  ? "✓" : "✗") + " Accessibility " +
-            AutoShootService.getStatus().substring(0, Math.min(AutoShootService.getStatus().length(), 20)) + "
-" +
-            (captureOk ? "✓" : "✗") + " Screen Capture"
-        );
+        statusView.setText((accessOk ? "[A:OK]" : "[A:OFF]") + " Accessibility  " + (captureOk ? "[C:OK]" : "[C:OFF]") + " Capture");
         statusView.setTextColor(accessOk ? 0xFF22DD55 : 0xFFFFAA33);
         statusView.setTextSize(10);
         statusView.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
@@ -344,7 +339,7 @@ public class FloatingOverlayService extends Service {
 
         // ── AutoPlay / Accessibility CTA ──────────────────────────────────────
         if (!accessOk) {
-            addPopupBtn(ll, pad, "ENABLE ACCESSIBILITY →", 0xFFFFAA33,
+            addPopupBtn(ll, pad, "ENABLE ACCESSIBILITY ->", 0xFFFFAA33,
                 v -> {
                     android.content.Intent i = new android.content.Intent(
                         android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
@@ -361,7 +356,7 @@ public class FloatingOverlayService extends Service {
 
         // ── TEST SHOT — one gesture to prove the engine works ─────────────────
         if (accessOk) {
-            addPopupBtn(ll, pad, "► TEST SHOT", 0xFFFFD700,
+            addPopupBtn(ll, pad, "> TEST SHOT", 0xFFFFD700,
                 v -> {
                     AutoShootService svc = AutoShootService.INSTANCE;
                     if (svc != null) {
@@ -531,10 +526,10 @@ public class FloatingOverlayService extends Service {
      * Called on every live CV frame (~30 fps).
      *
      * Stability flow:
-     *   frames 1-2   : striker moved → reset
+     *   frames 1-2   : striker moved -> reset
      *   frame 3      : start background physics prefetch
      *   frames 3–9   : waiting for stability + physics result
-     *   frame 10     : board stable → fire shot
+     *   frame 10     : board stable -> fire shot
      *
      * STABLE_THRESH_PX is now 40 px so ordinary CV pixel-noise
      * does not reset the counter on every frame.
@@ -594,7 +589,7 @@ public class FloatingOverlayService extends Service {
 
         if (physShot != null) {
             // ── SMART DETECT: verify shot lane is clear of blocking pucks ──────
-            // If any coin is blocking the striker→ghost path, skip this shot and
+            // If any coin is blocking the striker->ghost path, skip this shot and
             // wait for the board to change. This is the "see the pucks to go or
             // not" check — autoplay only fires when the lane is genuinely open.
             if (!isShotPathClear(s, physShot)) {
@@ -641,7 +636,7 @@ public class FloatingOverlayService extends Service {
      * any coin blocking the path.
      *
      * For every coin on the board (excluding the target coin), compute the
-     * perpendicular distance from that coin's centre to the striker→ghost line
+     * perpendicular distance from that coin's centre to the striker->ghost line
      * segment. If it is less than (coinRadius + strikerRadius + 4 px margin)
      * the lane is blocked and autoplay waits.
      */
@@ -670,7 +665,7 @@ public class FloatingOverlayService extends Service {
         return true;
     }
 
-    /** Shortest distance from point P=(px,py) to segment A→B (clamped). */
+    /** Shortest distance from point P=(px,py) to segment A->B (clamped). */
     private static float pointToSegmentDist(float px, float py,
                                             float ax, float ay,
                                             float bx, float by) {
