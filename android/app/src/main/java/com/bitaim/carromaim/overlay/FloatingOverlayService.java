@@ -313,7 +313,7 @@ public class FloatingOverlayService extends Service {
         ll.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("CarromBot v9.0");
+        title.setText("CarromBot v10.0");
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor("#FFD700"));
         title.setTextSize(14);
@@ -695,7 +695,7 @@ public class FloatingOverlayService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "CarromBot v9.0 Running", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "CarromBot v10.0 Running", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Aim assist overlay active — physics AI ready");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
@@ -711,7 +711,7 @@ public class FloatingOverlayService extends Service {
         Intent openIntent    = new Intent(this, MainActivity.class);
         PendingIntent openPi = PendingIntent.getActivity(this, 1, openIntent, piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("CarromBot v9.0 — Multi-Strategy Bot")
+                .setContentTitle("CarromBot v10.0 — Slingshot Bot")
                 .setContentText("Ghost-ball + sub-pixel physics autoplay ready")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(openPi)
