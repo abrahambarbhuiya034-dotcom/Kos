@@ -1,38 +1,48 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  AIM floating button — drag to move, tap to open control popup.
-  Uses a crosshair / target icon for clear visual identity.
+  CarromBot eSports floating button
+  Dark with neon-blue glow ring, crosshair icon, "BOT" label
 -->
 <FrameLayout
     xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="60dp"
-    android:layout_height="60dp">
+    android:layout_width="64dp"
+    android:layout_height="64dp">
 
-    <!-- Glowing background circle -->
+    <!-- Outer glow ring -->
     <View
-        android:layout_width="56dp"
-        android:layout_height="56dp"
+        android:layout_width="62dp"
+        android:layout_height="62dp"
         android:layout_gravity="center"
         android:background="@drawable/floating_btn_bg" />
 
-    <!-- Crosshair icon -->
+    <!-- Inner dark fill -->
+    <View
+        android:layout_width="52dp"
+        android:layout_height="52dp"
+        android:layout_gravity="center"
+        android:background="#CC060A14" />
+
+    <!-- Crosshair / target icon -->
     <ImageView
         android:id="@+id/floating_icon"
-        android:layout_width="32dp"
-        android:layout_height="32dp"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
         android:layout_gravity="center"
+        android:layout_marginBottom="6dp"
         android:src="@drawable/ic_target"
-        android:contentDescription="AIMxASSIST control" />
+        android:contentDescription="CarromBot control"
+        android:alpha="0.95" />
 
-    <!-- "AIM" label at the bottom -->
+    <!-- BOT label -->
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="bottom|center_horizontal"
-        android:layout_marginBottom="2dp"
-        android:text="AIM"
-        android:textColor="#FF00E5FF"
+        android:layout_marginBottom="4dp"
+        android:text="BOT"
+        android:textColor="#FF00D4FF"
         android:textSize="7sp"
-        android:textStyle="bold" />
+        android:textStyle="bold"
+        android:letterSpacing="0.15" />
 
 </FrameLayout>
