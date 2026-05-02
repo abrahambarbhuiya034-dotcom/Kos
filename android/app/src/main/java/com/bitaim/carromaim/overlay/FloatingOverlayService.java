@@ -537,7 +537,7 @@ public class FloatingOverlayService extends Service {
 
         if (stableFrames < STABLE_FRAMES_NEEDED) return;
 
-        // Board stable — fire!
+        // Board stable — smart path check then fire!
         CarromAI.AiShot physShot = precomputedShot;
 
         // Guard against race: service may have disconnected between isReady() check and here
@@ -545,6 +545,19 @@ public class FloatingOverlayService extends Service {
         if (acc == null) return;
 
         if (physShot != null) {
+            // ── SMART DETECT: verify shot lane is clear of blocking pucks ──────
+            // If any coin is blocking the striker→ghost path, skip this shot and
+            // wait for the board to change. This is the "see the pucks to go or
+            // not" check — autoplay only fires when the lane is genuinely open.
+            if (!isShotPathClear(s, physShot)) {
+                Log.d(TAG, "AutoPlay BLOCKED: puck on shot path — waiting for clear lane");
+                stableFrames    = Math.max(0, stableFrames - 2);
+                precomputedShot  = null;
+                precomputedState = null;
+                computing.set(false);
+                return;
+            }
+
             float dx = physShot.ghostPos.x - s.striker.pos.x;
             float dy = physShot.ghostPos.y - s.striker.pos.y;
             float factor = 1.20f;
@@ -552,7 +565,7 @@ public class FloatingOverlayService extends Service {
             float toY = s.striker.pos.y + dy * factor;
             float pwr = Math.min(1.0f, Math.max(0.35f, physShot.powerFrac));
             Log.i(TAG, String.format(
-                "AutoPlay PHYSICS: stable=%d pwr=%.2f target=(%.0f,%.0f)",
+                "AutoPlay FIRE v8.5: stable=%d pwr=%.2f target=(%.0f,%.0f) pathClear=true",
                 stableFrames, pwr, toX, toY));
             acc.shoot(s.striker.pos.x, s.striker.pos.y, toX, toY, pwr);
         } else {
@@ -571,6 +584,53 @@ public class FloatingOverlayService extends Service {
         stableFrames    = 0;
         precomputedShot = null;
         precomputedState = null;
+    }
+
+    // ── Smart path-clear check ────────────────────────────────────────────────
+
+    /**
+     * Returns true if the striker can reach the ghost-ball contact point without
+     * any coin blocking the path.
+     *
+     * For every coin on the board (excluding the target coin), compute the
+     * perpendicular distance from that coin's centre to the striker→ghost line
+     * segment. If it is less than (coinRadius + strikerRadius + 4 px margin)
+     * the lane is blocked and autoplay waits.
+     */
+    private boolean isShotPathClear(GameState s, CarromAI.AiShot shot) {
+        if (shot == null || s == null || s.striker == null) return false;
+
+        float sX = s.striker.pos.x, sY = s.striker.pos.y;
+        float gX = shot.ghostPos.x,  gY = shot.ghostPos.y;
+        float margin = 4f;
+
+        for (com.bitaim.carromaim.cv.Coin c : s.coins) {
+            // Skip the target coin — the ghost-ball intentionally contacts it
+            if (shot.coin != null
+                    && Math.abs(c.pos.x - shot.coin.pos.x) < 2f
+                    && Math.abs(c.pos.y - shot.coin.pos.y) < 2f) continue;
+
+            float minDist = c.radius + s.striker.radius + margin;
+            float dist    = pointToSegmentDist(c.pos.x, c.pos.y, sX, sY, gX, gY);
+            if (dist < minDist) {
+                Log.d(TAG, String.format(
+                    "isShotPathClear: BLOCKED by coin at (%.0f,%.0f) dist=%.1f",
+                    c.pos.x, c.pos.y, dist));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** Shortest distance from point P=(px,py) to segment A→B (clamped). */
+    private static float pointToSegmentDist(float px, float py,
+                                            float ax, float ay,
+                                            float bx, float by) {
+        float dx = bx - ax, dy = by - ay;
+        float len2 = dx*dx + dy*dy;
+        if (len2 < 1f) return (float) Math.hypot(px-ax, py-ay);
+        float t = Math.max(0f, Math.min(1f, ((px-ax)*dx + (py-ay)*dy) / len2));
+        return (float) Math.hypot(px - (ax + t*dx), py - (ay + t*dy));
     }
 
     private void toggleAutoPlayFromPopup() {
