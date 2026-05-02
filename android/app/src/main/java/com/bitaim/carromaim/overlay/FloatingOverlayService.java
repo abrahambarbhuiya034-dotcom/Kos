@@ -99,6 +99,7 @@ public class FloatingOverlayService extends Service {
     private boolean popupShowing   = false;
 
     private volatile boolean autoPlayEnabled = false;
+    private volatile com.bitaim.carromaim.cv.GameState lastState = null;
     private int     stableFrames    = 0;
     private float   lastStrikerX    = Float.NaN;
     private float   lastStrikerY    = Float.NaN;
@@ -312,7 +313,7 @@ public class FloatingOverlayService extends Service {
         ll.setPadding(pad, pad, pad, pad);
 
         TextView title = new TextView(this);
-        title.setText("AIMxASSIST v8.3");
+        title.setText("CarromBot v9.0");
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setTextColor(Color.parseColor("#FFD700"));
         title.setTextSize(14);
@@ -325,19 +326,65 @@ public class FloatingOverlayService extends Service {
                 overlayVisible ? 0xFFFF5555 : 0xFF22DD55,
                 v -> { toggleAimOverlay(); dismissPopup(); });
 
-        addPopupBtn(ll, pad,
-                autoPlayEnabled
-                    ? "AutoPlay OFF"
-                    : (AutoShootService.isReady() ? "AutoPlay ON" : "Need Accessibility"),
-                autoPlayEnabled ? 0xFFFF5555 : 0xFF6699FF,
-                v -> { toggleAutoPlayFromPopup(); dismissPopup(); });
+        // ── Status panel ─────────────────────────────────────────────────
+        boolean accessOk  = AutoShootService.isReady();
+        boolean captureOk = com.bitaim.carromaim.capture.ScreenCaptureService.INSTANCE != null;
+        TextView statusView = new TextView(this);
+        statusView.setText(
+            (accessOk  ? "✓" : "✗") + " Accessibility " +
+            AutoShootService.getStatus().substring(0, Math.min(AutoShootService.getStatus().length(), 20)) + "
+" +
+            (captureOk ? "✓" : "✗") + " Screen Capture"
+        );
+        statusView.setTextColor(accessOk ? 0xFF22DD55 : 0xFFFFAA33);
+        statusView.setTextSize(10);
+        statusView.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
+        statusView.setPadding(0, 0, 0, (int)(6*dp));
+        ll.addView(statusView);
+
+        // ── AutoPlay / Accessibility CTA ──────────────────────────────────────
+        if (!accessOk) {
+            addPopupBtn(ll, pad, "ENABLE ACCESSIBILITY →", 0xFFFFAA33,
+                v -> {
+                    android.content.Intent i = new android.content.Intent(
+                        android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS);
+                    i.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(i);
+                    dismissPopup();
+                });
+        } else {
+            addPopupBtn(ll, pad,
+                    autoPlayEnabled ? "AutoPlay OFF" : "AutoPlay ON",
+                    autoPlayEnabled ? 0xFFFF5555 : 0xFF6699FF,
+                    v -> { toggleAutoPlayFromPopup(); dismissPopup(); });
+        }
+
+        // ── TEST SHOT — one gesture to prove the engine works ─────────────────
+        if (accessOk) {
+            addPopupBtn(ll, pad, "► TEST SHOT", 0xFFFFD700,
+                v -> {
+                    AutoShootService svc = AutoShootService.INSTANCE;
+                    if (svc != null) {
+                        com.bitaim.carromaim.cv.GameState gs = lastState;
+                        if (gs != null && gs.striker != null) {
+                            svc.testFire(gs.striker.pos.x, gs.striker.pos.y);
+                        } else {
+                            android.util.DisplayMetrics dm2 = new android.util.DisplayMetrics();
+                            ((android.view.WindowManager) getSystemService(WINDOW_SERVICE))
+                                .getDefaultDisplay().getRealMetrics(dm2);
+                            svc.testFire(dm2.widthPixels / 2f, dm2.heightPixels / 2f);
+                        }
+                    }
+                    dismissPopup();
+                });
+        }
 
         if (autoPlayEnabled) {
             TextView hint = new TextView(this);
-            hint.setText("Physics AI active\nFires on stable board");
+            hint.setText("4-Strategy Bot Active\nCheck logcat: CarromBot");
             hint.setTextColor(0xFF22DD55);
-            hint.setTextSize(11);
-            hint.setGravity(Gravity.CENTER_HORIZONTAL);
+            hint.setTextSize(10);
+            hint.setGravity(android.view.Gravity.CENTER_HORIZONTAL);
             hint.setPadding(0, (int)(5*dp), 0, 0);
             ll.addView(hint);
         }
@@ -436,6 +483,7 @@ public class FloatingOverlayService extends Service {
     }
 
     public void onDetectedState(GameState s) {
+        lastState = s;
         if (s == null) return;
         if (aimOverlayView != null) {
             aimOverlayView.setDetectedState(s);
@@ -652,7 +700,7 @@ public class FloatingOverlayService extends Service {
     private void createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             NotificationChannel ch = new NotificationChannel(
-                    CHANNEL_ID, "AIMxASSIST v8.3 Running", NotificationManager.IMPORTANCE_LOW);
+                    CHANNEL_ID, "CarromBot v9.0 Running", NotificationManager.IMPORTANCE_LOW);
             ch.setDescription("Aim assist overlay active — physics AI ready");
             NotificationManager nm = getSystemService(NotificationManager.class);
             if (nm != null) nm.createNotificationChannel(ch);
@@ -668,7 +716,7 @@ public class FloatingOverlayService extends Service {
         Intent openIntent    = new Intent(this, MainActivity.class);
         PendingIntent openPi = PendingIntent.getActivity(this, 1, openIntent, piFlags);
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("AIMxASSIST v8.3 — Physics AI Active")
+                .setContentTitle("CarromBot v9.0 — Multi-Strategy Bot")
                 .setContentText("Ghost-ball + sub-pixel physics autoplay ready")
                 .setSmallIcon(R.mipmap.ic_launcher)
                 .setContentIntent(openPi)
