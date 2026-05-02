@@ -1,104 +1,54 @@
-AIMxASSIST v8.4 — Aim Line Bug Fixes
-======================================
+AIMxASSIST v8.4 — Overlay Visual & AutoPlay Fixes
+====================================================
 
 BUGS FIXED IN v8.4
-──────────────────
+------------------
 
-1. Aim lines never updated after coins were pocketed  [AimOverlayView.java]
+1. Ghost coin circles cluttered the board  [AimOverlayView.java]
 
-   ROOT CAUSE: rebuildCacheIfNeeded() only compared the SMOOTHED striker
-   position to decide whether to refresh the shot list. With EMA_ALPHA=0.10
-   the smoothed position barely moves (90% old + 10% new), so even after the
-   striker repositioned by 50+ pixels the smoothed delta stayed below the
-   15 px threshold — the cache was NEVER rebuilt.
+   ROOT CAUSE: onDraw() rendered all CV-detected coins as semi-transparent
+   white/black circles overlaid on the real board, creating confusing ghost
+   discs on every frame.
 
-   Additionally, when coins were pocketed between shots the cached AiShot
-   objects still pointed at those now-missing coins. Lines kept drawing toward
-   empty spaces.
+   FIX: Removed the coin-drawing loop entirely. Only aim arrows and pocket
+   markers are drawn. CV detection still uses coins internally for shot
+   computation — they are just no longer rendered.
 
-   FIX A: rebuildCacheIfNeeded() now compares the RAW DETECTED striker
-   position (not the smoothed one) against the cached position. This ensures
-   the cache refreshes as soon as the real striker has moved.
+2. Aim lines cluttered the striker position  [AimOverlayView.java]
 
-   FIX B: Added coinsHash() — a fast integer hash of coin count + rounded
-   positions. The cache is also invalidated whenever this hash changes, so
-   pocketing a coin immediately causes the shot list to be recomputed.
+   ROOT CAUSE: Lines were drawn FROM the striker centre to the ghost-ball
+   contact point, causing a confusing ray-burst pattern centred on the
+   striker. The user could not see where to aim at a glance.
 
-   FIX C: Added cacheCoinsHash field (initialised to -1) and reset it in
-   invalidateCache() so it is correctly cleared on mode change.
+   FIX: Removed all striker→ghost line segments. Instead a DIRECTIONAL
+   ARROW is drawn AT the ghost-ball endpoint (the "last point" of the shot):
+     • Arrow tip points in the direction of striker travel
+     • Short tail-stem shows which direction the striker came from
+     • Soft glow ring highlights the endpoint
+   Best shot: bright GOLD arrow. Ranks 2-5: progressively dimmer cyan/white.
 
-2. Demo mode showed no aim lines on startup  [AimOverlayView.java]
+3. Coin→pocket line is kept [AimOverlayView.java]
 
-   ROOT CAUSE: setStateInternal() only called rebuildCacheIfNeeded() when
-   live=true. setDemoState() passed live=false, so the cache was never built
-   for the demo state injected at startup. The overlay appeared to be broken
-   (coins drawn, but no aim lines at all).
+   The trajectory line showing where the targeted coin will travel to the
+   pocket is preserved — it is the most useful visual cue for the player.
 
-   FIX: Removed the `if (live)` guard — rebuildCacheIfNeeded() is now called
-   for both live and demo states. The cache correctly uses the raw detected
-   state as its key so demo shots are computed immediately.
+4. AutoPlay gesture unreliable  [AutoShootService.java]
 
-3. EMA smoothing too slow — positions lagged 0.5–1 s behind reality
-   [AimOverlayView.java]
+   ROOT CAUSE: Swipe started exactly at the striker centre. Carrom Disc Pool
+   treats this as a tap, not a shot gesture, and ignores it.
 
-   ROOT CAUSE: EMA_ALPHA = 0.10 means each frame takes 90% old + 10% new.
-   At 30 fps it takes ~22 frames (~730 ms) for the smoothed position to
-   reach 90% of the real position. Aim lines pointed at where the striker
-   WAS, not where it IS.
+   FIX: Gesture now starts BEHIND the striker (25–55 px opposite to shot
+   direction) and flicks THROUGH the striker toward the target. This matches
+   the natural "flick" motion the game expects.
 
-   FIX: EMA_ALPHA raised from 0.10 → 0.25. At 30 fps, 90% convergence now
-   takes ~8 frames (~270 ms). Lines track the real board state 2.7× faster.
-
-   Cache threshold lowered from 15 px → 12 px to compensate (smaller
-   smoothing lag means smaller per-frame position delta).
-
-4. Edge-coin aim lines were clipped and disappeared  [AimOverlayView.java]
-
-   ROOT CAUSE: drawLineSafe() clipped every line (including the striker→ghost
-   segment) to the detected board rect. When a coin is near the board edge,
-   the ghost-ball contact point lands just OUTSIDE the detected board rect
-   (the rect is measured at the frame, so ghost positions at the very edge
-   are technically outside). Cohen-Sutherland then clipped the entire line
-   away, making those shots invisible.
-
-   FIX: Segment A (striker → ghost) now uses an EXPANDED clip rect:
-   board inset enlarged by 1.5 × striker_radius on each side. Edge shots
-   remain visible. Segment B (coin → pocket) still clips to the exact board
-   rect since that path should stay within the playing surface.
-
-5. IndexOutOfBoundsException / wrong pocket line when fewer than 4 pockets
-   detected  [CarromAI.java]
-
-   ROOT CAUSE: findBestShots() called state.pockets.get(pi) where pi went
-   0–3 (the length of the static POCKETS[] array). If the detector returned
-   fewer than 4 pockets the get() either threw or returned the wrong pocket.
-
-   FIX: Added guard `if (pi >= state.pockets.size()) continue;` before every
-   state.pockets.get(pi) call so missing pockets are silently skipped.
-
-6. Blank overlay when all shots blocked by dense coin cluster  [CarromAI.java]
-
-   ROOT CAUSE: pathClear() eliminates shots whose striker-to-ghost path passes
-   through another coin. On a crowded board (opening position) all candidate
-   shots can be blocked, returning an empty list. With an empty list the
-   overlay showed no lines at all.
-
-   FIX: Added a fallback path in findBestShots(): if the deduped list is
-   still empty after the main loop, find the closest coin to the striker and
-   add one straight shot toward its best pocket WITHOUT a path-clear check.
-   This guarantees at least one aim line is always visible.
-
-7. Near-duplicate aim lines cluttered the overlay  [CarromAI.java]
-
-   ROOT CAUSE: The ghost-proximity deduplication threshold was 10 px. On
-   coins close together (e.g. the starting cluster) many ghost positions
-   differ by 10–15 px, producing near-identical overlapping lines.
-
-   FIX: Deduplication threshold raised from 10 px → 18 px, resulting in
-   visually distinct aim lines only.
+   Additional changes:
+     • Swipe distance: 160 px (soft) → 460 px (full power). Old range
+       120–360 px was too short on high-density screens.
+     • Duration: 80–140 ms (was 60–120 ms). Avoids game input debounce.
+     • Backstep scales with power (25–55 px) for proportional feel.
 
 UNCHANGED FROM v8.3
-────────────────────
-   BoardDetector.java, TrajectorySimulator.java, AutoShootService.java,
+-------------------
+   BoardDetector.java, TrajectorySimulator.java, CarromAI.java,
    OverlayModule.java, ScreenCaptureService.java, FloatingOverlayService.java,
-   App.tsx, android/app/build.gradle
+   App.tsx, android/app/build.gradle, .github/workflows/build-apk.yml
